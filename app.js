@@ -30,8 +30,10 @@ let cellSize = CELL_FALLBACK;
 let crateItemCounter = 0;
 let dragSizeIndicatorEl = null;
 let activeDragPayload = null;
-
-const DRAG_PAYLOAD_TYPE = "application/zenloot-payload";
+let isDraggingNow = false;
+let dragPointerId = null;
+let dragSourceElement = null;
+let lastDragOverPointer = null;
 
 function createLoot(id, name, icon, size, canNest, nestedSize = null) {
   return {
@@ -42,39 +44,6 @@ function createLoot(id, name, icon, size, canNest, nestedSize = null) {
     canNest,
     nestedSize: canNest ? nestedSize : null,
   };
-}
-
-function setDragPayload(event, payload) {
-  const serialized = JSON.stringify(payload);
-  event.dataTransfer.setData(DRAG_PAYLOAD_TYPE, serialized);
-  event.dataTransfer.setData("text/plain", serialized);
-  event.dataTransfer.effectAllowed = "move";
-}
-
-function parseDragPayload(event) {
-  const data =
-    event.dataTransfer.getData(DRAG_PAYLOAD_TYPE) ||
-    event.dataTransfer.getData("text/plain");
-
-  if (!data) return null;
-
-  try {
-    const payload = JSON.parse(data);
-    if (payload && payload.id) {
-      return {
-        ...payload,
-        anchor: normalizeAnchor(payload.anchor),
-      };
-    }
-  } catch (_) {
-    return {
-      source: "nearby",
-      id: data,
-      anchor: { col: 0, row: 0 },
-    };
-  }
-
-  return null;
 }
 
 function normalizeAnchor(anchor) {
@@ -101,6 +70,7 @@ function initLootInterface() {
   if (!Number.isNaN(cssCellSize)) {
     cellSize = cssCellSize;
   }
+  window.addEventListener("keydown", handleDragKeydown);
   renderNearbyLoot();
   buildCrate();
 }
@@ -123,14 +93,11 @@ function renderNearbyLoot() {
   nearbyLoot.forEach((loot) => {
     const card = document.createElement("div");
     card.className = "loot-card";
-    card.draggable = true;
     card.dataset.lootId = loot.id;
 
-    card.addEventListener("dragstart", (event) => handleNearbyDragStart(event, loot));
-    card.addEventListener("dragend", () => {
-      card.classList.remove("is-dragging");
-      clearActiveDragState();
-    });
+    card.addEventListener("pointerdown", (event) =>
+      handleNearbyPointerDown(event, loot),
+    );
 
     const icon = document.createElement("span");
     icon.className = "loot-card-icon";
@@ -160,19 +127,21 @@ function renderNearbyLoot() {
   }
 }
 
-function handleNearbyDragStart(event, loot) {
+function handleNearbyPointerDown(event, loot) {
+  if (!isPrimaryPointer(event)) return;
+  event.preventDefault();
   const payload = {
     source: "nearby",
     id: loot.id,
     anchor: { col: 0, row: 0 },
     size: { ...loot.size },
   };
-  setDragPayload(event, payload);
-  activeDragPayload = payload;
-  event.currentTarget.classList.add("is-dragging");
+  beginManualDrag(event, payload, event.currentTarget);
 }
 
-function handleCrateTileDragStart(event, lootItem) {
+function handleCrateTilePointerDown(event, lootItem) {
+  if (!isPrimaryPointer(event)) return;
+  event.preventDefault();
   const anchor = getTileAnchor(event, lootItem);
   const payload = {
     source: "crate",
@@ -180,18 +149,17 @@ function handleCrateTileDragStart(event, lootItem) {
     anchor,
     size: { ...lootItem.size },
   };
-  setDragPayload(event, payload);
-  activeDragPayload = payload;
-  event.currentTarget.classList.add("is-dragging");
+  beginManualDrag(event, payload, event.currentTarget);
 }
 
 function getTileAnchor(event, lootItem) {
-  if (!lootItem) {
+  if (!lootItem || !event.currentTarget) {
     return { col: 0, row: 0 };
   }
 
-  const localX = "offsetX" in event ? event.offsetX : 0;
-  const localY = "offsetY" in event ? event.offsetY : 0;
+  const rect = event.currentTarget.getBoundingClientRect();
+  const localX = event.clientX - rect.left;
+  const localY = event.clientY - rect.top;
   const col = clampAnchorIndex(localX / cellSize, lootItem.size.w);
   const row = clampAnchorIndex(localY / cellSize, lootItem.size.h);
   return { col, row };
@@ -215,10 +183,6 @@ function buildCrate() {
   crateGridEl.dataset.columns = crateConfig.columns;
   crateGridEl.dataset.rows = crateConfig.rows;
 
-  crateGridEl.addEventListener("dragover", handleCrateDragOver);
-  crateGridEl.addEventListener("dragleave", handleCrateDragLeave);
-  crateGridEl.addEventListener("drop", handleCrateDrop);
-
   crateEl.append(title, crateGridEl);
   zone.appendChild(crateEl);
 
@@ -236,16 +200,11 @@ function renderCrateItems() {
     tile.style.height = `${item.size.h * cellSize}px`;
     tile.style.left = `${item.position.col * cellSize}px`;
     tile.style.top = `${item.position.row * cellSize}px`;
-    tile.draggable = true;
     tile.dataset.lootInstanceId = item.instanceId || item.id;
 
-    tile.addEventListener("dragstart", (event) =>
-      handleCrateTileDragStart(event, item),
+    tile.addEventListener("pointerdown", (event) =>
+      handleCrateTilePointerDown(event, item),
     );
-    tile.addEventListener("dragend", () => {
-      tile.classList.remove("is-dragging");
-      clearActiveDragState();
-    });
 
     const icon = document.createElement("div");
     icon.className = "loot-tile-icon";
@@ -266,36 +225,94 @@ function renderCrateItems() {
   ensureDragSizeIndicator();
 }
 
-function handleCrateDragOver(event) {
-  event.preventDefault();
-  if (!crateGridEl) return;
+function beginManualDrag(event, payload, sourceElement) {
+  if (!payload) return;
+  if (isDraggingNow) {
+    clearActiveDragState();
+  }
 
-  crateGridEl.classList.add("crate-grid--active");
-  event.dataTransfer.dropEffect = "move";
+  activeDragPayload = payload;
+  isDraggingNow = true;
+  dragPointerId =
+    typeof event.pointerId === "number" && Number.isFinite(event.pointerId)
+      ? event.pointerId
+      : null;
+  dragSourceElement = sourceElement || null;
+  if (dragSourceElement) {
+    dragSourceElement.classList.add("is-dragging");
+  }
+  lastDragOverPointer = null;
 
-  const payload = activeDragPayload || parseDragPayload(event);
-  if (payload && payload.size) {
-    showDragSizeIndicator(event, payload);
+  window.addEventListener("pointermove", handleGlobalPointerMove);
+  window.addEventListener("pointerup", handleGlobalPointerUp);
+  window.addEventListener("pointercancel", handleGlobalPointerCancel);
+
+  updateCrateHoverState(event);
+}
+
+function updateCrateHoverState(event) {
+  if (!crateGridEl || !activeDragPayload) return;
+  const inside = isPointerInsideCrate(event);
+  if (inside) {
+    crateGridEl.classList.add("crate-grid--active");
+    lastDragOverPointer = { clientX: event.clientX, clientY: event.clientY };
+    showDragSizeIndicator(event, activeDragPayload);
   } else {
+    crateGridEl.classList.remove("crate-grid--active");
     hideDragSizeIndicator();
+    lastDragOverPointer = null;
   }
 }
 
-function handleCrateDragLeave() {
-  if (!crateGridEl) return;
-  crateGridEl.classList.remove("crate-grid--active");
-  hideDragSizeIndicator();
+function handleGlobalPointerMove(event) {
+  if (!isDraggingNow) {
+    return;
+  }
+  if (dragPointerId !== null && event.pointerId !== dragPointerId) {
+    return;
+  }
+  updateCrateHoverState(event);
 }
 
-function handleCrateDrop(event) {
-  event.preventDefault();
+function handleGlobalPointerUp(event) {
+  if (!isDraggingNow) {
+    return;
+  }
+  if (dragPointerId !== null && event.pointerId !== dragPointerId) {
+    return;
+  }
+  const inside = isPointerInsideCrate(event);
+  if (inside) {
+    attemptCrateDrop(event);
+  } else {
+    crateGridEl?.classList.remove("crate-grid--active");
+    hideDragSizeIndicator();
+  }
+  clearActiveDragState();
+}
+
+function handleGlobalPointerCancel(event) {
+  if (dragPointerId !== null && event.pointerId !== dragPointerId) {
+    return;
+  }
+  clearActiveDragState();
+}
+
+function isPointerInsideCrate(event) {
+  if (!crateGridEl) return false;
+  const rect = crateGridEl.getBoundingClientRect();
+  return (
+    event.clientX >= rect.left &&
+    event.clientX <= rect.right &&
+    event.clientY >= rect.top &&
+    event.clientY <= rect.bottom
+  );
+}
+
+function attemptCrateDrop(event) {
   if (!crateGridEl) return;
 
-  crateGridEl.classList.remove("crate-grid--active");
-  hideDragSizeIndicator();
-
-  const payload = parseDragPayload(event);
-  clearActiveDragState();
+  const payload = activeDragPayload;
   if (!payload || !payload.id) {
     flashInvalidDrop();
     return;
@@ -310,6 +327,16 @@ function handleCrateDrop(event) {
   }
 }
 
+function isPrimaryPointer(event) {
+  if (typeof event.button === "number" && event.button !== 0) {
+    return false;
+  }
+  if (typeof event.buttons === "number" && event.buttons !== 0 && (event.buttons & 1) === 0) {
+    return false;
+  }
+  return true;
+}
+
 function moveItemFromNearby(payload, event) {
   const lootIndex = nearbyLoot.findIndex((item) => item.id === payload.id);
   if (lootIndex === -1) {
@@ -318,7 +345,10 @@ function moveItemFromNearby(payload, event) {
   }
 
   const loot = nearbyLoot[lootIndex];
-  const position = resolveDropPosition(event, loot, {
+  const placementCandidate = payload.size
+    ? { ...loot, size: { ...payload.size } }
+    : loot;
+  const position = resolveDropPosition(event, placementCandidate, {
     anchor: payload.anchor,
   });
 
@@ -327,7 +357,7 @@ function moveItemFromNearby(payload, event) {
     return;
   }
 
-  storageCrate.items.push(createStoredItem(loot, position));
+  storageCrate.items.push(createStoredItem(placementCandidate, position));
   nearbyLoot.splice(lootIndex, 1);
 
   renderNearbyLoot();
@@ -346,7 +376,10 @@ function moveItemInsideCrate(payload, event) {
 
   const item = storageCrate.items[itemIndex];
   const ignoreId = item.instanceId || item.id;
-  const position = resolveDropPosition(event, item, {
+  const placementCandidate = payload.size
+    ? { ...item, size: { ...payload.size } }
+    : item;
+  const position = resolveDropPosition(event, placementCandidate, {
     ignoreItemId: ignoreId,
     anchor: payload.anchor,
   });
@@ -358,6 +391,7 @@ function moveItemInsideCrate(payload, event) {
 
   storageCrate.items[itemIndex] = {
     ...item,
+    size: { ...placementCandidate.size },
     position,
   };
 
@@ -482,6 +516,19 @@ function hideDragSizeIndicator() {
 function clearActiveDragState() {
   activeDragPayload = null;
   hideDragSizeIndicator();
+  isDraggingNow = false;
+  lastDragOverPointer = null;
+  if (crateGridEl) {
+    crateGridEl.classList.remove("crate-grid--active");
+  }
+  if (dragSourceElement) {
+    dragSourceElement.classList.remove("is-dragging");
+    dragSourceElement = null;
+  }
+  window.removeEventListener("pointermove", handleGlobalPointerMove);
+  window.removeEventListener("pointerup", handleGlobalPointerUp);
+  window.removeEventListener("pointercancel", handleGlobalPointerCancel);
+  dragPointerId = null;
 }
 
 function clampAnchorIndex(value, maxSize) {
@@ -501,6 +548,54 @@ function clamp(value, min, max) {
     return min;
   }
   return Math.min(Math.max(value, min), max);
+}
+
+function handleDragKeydown(event) {
+  if (!isDraggingNow || event.defaultPrevented) {
+    return;
+  }
+  if (event.code !== "Space" && event.key !== " ") {
+    return;
+  }
+  if (event.repeat) {
+    return;
+  }
+  console.log("Пробел нажат");
+  event.preventDefault();
+  rotateActiveDragPayload();
+}
+
+function rotateActiveDragPayload() {
+  if (!activeDragPayload || !activeDragPayload.size) {
+    return;
+  }
+  const { w, h } = activeDragPayload.size;
+  if (!Number.isFinite(w) || !Number.isFinite(h)) {
+    return;
+  }
+  const anchor = normalizeAnchor(activeDragPayload.anchor || { col: 0, row: 0 });
+  activeDragPayload = {
+    ...activeDragPayload,
+    anchor: {
+      col: clampAnchorIndex(anchor.row, h),
+      row: clampAnchorIndex(anchor.col, w),
+    },
+    size: { w: h, h: w },
+  };
+  refreshDragSizeIndicator();
+}
+
+function refreshDragSizeIndicator() {
+  if (!crateGridEl || !activeDragPayload || !lastDragOverPointer) {
+    return;
+  }
+  showDragSizeIndicator(
+    {
+      clientX: lastDragOverPointer.clientX,
+      clientY: lastDragOverPointer.clientY,
+    },
+    activeDragPayload,
+  );
 }
 
 initLootInterface();
