@@ -28,6 +28,8 @@ const nearbyLoot = [
 let crateGridEl;
 let cellSize = CELL_FALLBACK;
 let crateItemCounter = 0;
+let dragSizeIndicatorEl = null;
+let activeDragPayload = null;
 
 const DRAG_PAYLOAD_TYPE = "application/zenloot-payload";
 
@@ -125,7 +127,10 @@ function renderNearbyLoot() {
     card.dataset.lootId = loot.id;
 
     card.addEventListener("dragstart", (event) => handleNearbyDragStart(event, loot));
-    card.addEventListener("dragend", () => card.classList.remove("is-dragging"));
+    card.addEventListener("dragend", () => {
+      card.classList.remove("is-dragging");
+      clearActiveDragState();
+    });
 
     const icon = document.createElement("span");
     icon.className = "loot-card-icon";
@@ -156,21 +161,27 @@ function renderNearbyLoot() {
 }
 
 function handleNearbyDragStart(event, loot) {
-  setDragPayload(event, {
+  const payload = {
     source: "nearby",
     id: loot.id,
     anchor: { col: 0, row: 0 },
-  });
+    size: { ...loot.size },
+  };
+  setDragPayload(event, payload);
+  activeDragPayload = payload;
   event.currentTarget.classList.add("is-dragging");
 }
 
 function handleCrateTileDragStart(event, lootItem) {
   const anchor = getTileAnchor(event, lootItem);
-  setDragPayload(event, {
+  const payload = {
     source: "crate",
     id: lootItem.instanceId || lootItem.id,
     anchor,
-  });
+    size: { ...lootItem.size },
+  };
+  setDragPayload(event, payload);
+  activeDragPayload = payload;
   event.currentTarget.classList.add("is-dragging");
 }
 
@@ -231,9 +242,10 @@ function renderCrateItems() {
     tile.addEventListener("dragstart", (event) =>
       handleCrateTileDragStart(event, item),
     );
-    tile.addEventListener("dragend", () =>
-      tile.classList.remove("is-dragging"),
-    );
+    tile.addEventListener("dragend", () => {
+      tile.classList.remove("is-dragging");
+      clearActiveDragState();
+    });
 
     const icon = document.createElement("div");
     icon.className = "loot-tile-icon";
@@ -250,20 +262,29 @@ function renderCrateItems() {
     tile.append(icon, name, size);
     crateGridEl.appendChild(tile);
   });
+
+  ensureDragSizeIndicator();
 }
 
 function handleCrateDragOver(event) {
   event.preventDefault();
-  if (crateGridEl) {
-    crateGridEl.classList.add("crate-grid--active");
-    event.dataTransfer.dropEffect = "move";
+  if (!crateGridEl) return;
+
+  crateGridEl.classList.add("crate-grid--active");
+  event.dataTransfer.dropEffect = "move";
+
+  const payload = activeDragPayload || parseDragPayload(event);
+  if (payload && payload.size) {
+    showDragSizeIndicator(event, payload);
+  } else {
+    hideDragSizeIndicator();
   }
 }
 
 function handleCrateDragLeave() {
-  if (crateGridEl) {
-    crateGridEl.classList.remove("crate-grid--active");
-  }
+  if (!crateGridEl) return;
+  crateGridEl.classList.remove("crate-grid--active");
+  hideDragSizeIndicator();
 }
 
 function handleCrateDrop(event) {
@@ -271,8 +292,10 @@ function handleCrateDrop(event) {
   if (!crateGridEl) return;
 
   crateGridEl.classList.remove("crate-grid--active");
+  hideDragSizeIndicator();
 
   const payload = parseDragPayload(event);
+  clearActiveDragState();
   if (!payload || !payload.id) {
     flashInvalidDrop();
     return;
@@ -399,6 +422,68 @@ function flashInvalidDrop() {
   setTimeout(() => crateGridEl.classList.remove("crate-grid--invalid"), 220);
 }
 
+function ensureDragSizeIndicator() {
+  if (!crateGridEl) return null;
+
+  if (!dragSizeIndicatorEl) {
+    dragSizeIndicatorEl = document.createElement("div");
+    dragSizeIndicatorEl.className = "drag-size-indicator";
+  }
+
+  if (!crateGridEl.contains(dragSizeIndicatorEl)) {
+    crateGridEl.appendChild(dragSizeIndicatorEl);
+  }
+
+  return dragSizeIndicatorEl;
+}
+
+function showDragSizeIndicator(event, payload) {
+  if (!crateGridEl || !payload || !payload.size) return;
+  const indicator = ensureDragSizeIndicator();
+  if (!indicator) return;
+
+  const rect = crateGridEl.getBoundingClientRect();
+  const offsetX = clamp(event.clientX - rect.left, 0, rect.width);
+  const offsetY = clamp(event.clientY - rect.top, 0, rect.height);
+  const pointerCol = clamp(
+    Math.floor(offsetX / cellSize),
+    0,
+    Math.max(0, crateConfig.columns - 1),
+  );
+  const pointerRow = clamp(
+    Math.floor(offsetY / cellSize),
+    0,
+    Math.max(0, crateConfig.rows - 1),
+  );
+  const normalizedAnchor = normalizeAnchor(payload.anchor || { col: 0, row: 0 });
+  const anchorCol = clampAnchorIndex(normalizedAnchor.col, payload.size.w);
+  const anchorRow = clampAnchorIndex(normalizedAnchor.row, payload.size.h);
+
+  let startCol = pointerCol - anchorCol;
+  let startRow = pointerRow - anchorRow;
+  const maxCol = Math.max(0, crateConfig.columns - payload.size.w);
+  const maxRow = Math.max(0, crateConfig.rows - payload.size.h);
+  startCol = clamp(startCol, 0, maxCol);
+  startRow = clamp(startRow, 0, maxRow);
+
+  indicator.style.width = `${payload.size.w * cellSize}px`;
+  indicator.style.height = `${payload.size.h * cellSize}px`;
+  indicator.style.left = `${startCol * cellSize}px`;
+  indicator.style.top = `${startRow * cellSize}px`;
+  indicator.classList.add("is-visible");
+}
+
+function hideDragSizeIndicator() {
+  if (dragSizeIndicatorEl) {
+    dragSizeIndicatorEl.classList.remove("is-visible");
+  }
+}
+
+function clearActiveDragState() {
+  activeDragPayload = null;
+  hideDragSizeIndicator();
+}
+
 function clampAnchorIndex(value, maxSize) {
   if (!Number.isFinite(value)) {
     return 0;
@@ -406,6 +491,16 @@ function clampAnchorIndex(value, maxSize) {
   const floor = Math.floor(value);
   const upperBound = Math.max(0, maxSize - 1);
   return Math.min(Math.max(0, floor), upperBound);
+}
+
+function clamp(value, min, max) {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+  if (min > max) {
+    return min;
+  }
+  return Math.min(Math.max(value, min), max);
 }
 
 initLootInterface();
