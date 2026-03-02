@@ -34,6 +34,7 @@ let isDraggingNow = false;
 let dragPointerId = null;
 let dragSourceElement = null;
 let lastDragOverPointer = null;
+let lastIndicatorPlacement = null;
 
 function createLoot(id, name, icon, size, canNest, nestedSize = null) {
   return {
@@ -242,6 +243,7 @@ function beginManualDrag(event, payload, sourceElement) {
     dragSourceElement.classList.add("is-dragging");
   }
   lastDragOverPointer = null;
+  lastIndicatorPlacement = null;
 
   window.addEventListener("pointermove", handleGlobalPointerMove);
   window.addEventListener("pointerup", handleGlobalPointerUp);
@@ -348,9 +350,7 @@ function moveItemFromNearby(payload, event) {
   const placementCandidate = payload.size
     ? { ...loot, size: { ...payload.size } }
     : loot;
-  const position = resolveDropPosition(event, placementCandidate, {
-    anchor: payload.anchor,
-  });
+  const position = getDropPositionFromIndicator(placementCandidate);
 
   if (!position) {
     flashInvalidDrop();
@@ -379,10 +379,7 @@ function moveItemInsideCrate(payload, event) {
   const placementCandidate = payload.size
     ? { ...item, size: { ...payload.size } }
     : item;
-  const position = resolveDropPosition(event, placementCandidate, {
-    ignoreItemId: ignoreId,
-    anchor: payload.anchor,
-  });
+  const position = getDropPositionFromIndicator(placementCandidate, ignoreId);
 
   if (!position) {
     flashInvalidDrop();
@@ -396,37 +393,6 @@ function moveItemInsideCrate(payload, event) {
   };
 
   renderCrateItems();
-}
-
-function resolveDropPosition(event, loot, options = {}) {
-  if (!crateGridEl) return null;
-  const { ignoreItemId = null, anchor = { col: 0, row: 0 } } = options;
-  const rect = crateGridEl.getBoundingClientRect();
-  const offsetX = event.clientX - rect.left;
-  const offsetY = event.clientY - rect.top;
-
-  if (offsetX < 0 || offsetY < 0) return null;
-
-  const pointerCol = Math.floor(offsetX / cellSize);
-  const pointerRow = Math.floor(offsetY / cellSize);
-  const normalizedAnchor = normalizeAnchor(anchor);
-  const anchorCol = clampAnchorIndex(normalizedAnchor.col, loot.size.w);
-  const anchorRow = clampAnchorIndex(normalizedAnchor.row, loot.size.h);
-  const startCol = pointerCol - anchorCol;
-  const startRow = pointerRow - anchorRow;
-
-  if (
-    startCol < 0 ||
-    startRow < 0 ||
-    startCol + loot.size.w > crateConfig.columns ||
-    startRow + loot.size.h > crateConfig.rows
-  ) {
-    return null;
-  }
-
-  return isAreaFree(startRow, startCol, loot.size.w, loot.size.h, ignoreItemId)
-    ? { row: startRow, col: startCol }
-    : null;
 }
 
 function isAreaFree(row, col, width, height, ignoreItemId = null) {
@@ -492,18 +458,24 @@ function showDragSizeIndicator(event, payload) {
   const normalizedAnchor = normalizeAnchor(payload.anchor || { col: 0, row: 0 });
   const anchorCol = clampAnchorIndex(normalizedAnchor.col, payload.size.w);
   const anchorRow = clampAnchorIndex(normalizedAnchor.row, payload.size.h);
+  const placement = findNearestValidPlacement(
+    pointerRow,
+    pointerCol,
+    payload,
+    anchorCol,
+    anchorRow,
+  );
+  if (!placement) {
+    indicator.classList.remove("is-visible");
+    lastIndicatorPlacement = null;
+    return;
+  }
 
-  let startCol = pointerCol - anchorCol;
-  let startRow = pointerRow - anchorRow;
-  const maxCol = Math.max(0, crateConfig.columns - payload.size.w);
-  const maxRow = Math.max(0, crateConfig.rows - payload.size.h);
-  startCol = clamp(startCol, 0, maxCol);
-  startRow = clamp(startRow, 0, maxRow);
-
+  lastIndicatorPlacement = placement;
   indicator.style.width = `${payload.size.w * cellSize}px`;
   indicator.style.height = `${payload.size.h * cellSize}px`;
-  indicator.style.left = `${startCol * cellSize}px`;
-  indicator.style.top = `${startRow * cellSize}px`;
+  indicator.style.left = `${placement.col * cellSize}px`;
+  indicator.style.top = `${placement.row * cellSize}px`;
   indicator.classList.add("is-visible");
 }
 
@@ -511,6 +483,7 @@ function hideDragSizeIndicator() {
   if (dragSizeIndicatorEl) {
     dragSizeIndicatorEl.classList.remove("is-visible");
   }
+  lastIndicatorPlacement = null;
 }
 
 function clearActiveDragState() {
@@ -550,6 +523,69 @@ function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
 
+function findNearestValidPlacement(pointerRow, pointerCol, payload, anchorCol, anchorRow) {
+  if (!payload || !payload.size) {
+    return null;
+  }
+  const { w, h } = payload.size;
+  const maxCol = crateConfig.columns - w;
+  const maxRow = crateConfig.rows - h;
+  if (maxCol < 0 || maxRow < 0) {
+    return null;
+  }
+  const ignoreItemId =
+    payload.source === "crate" && payload.id ? payload.id : null;
+  let bestPlacement = null;
+  let bestDistance = Infinity;
+  let bestHeuristic = Infinity;
+
+  for (let row = 0; row <= maxRow; row += 1) {
+    for (let col = 0; col <= maxCol; col += 1) {
+      if (!isAreaFree(row, col, w, h, ignoreItemId)) {
+        continue;
+      }
+      const anchorColAbs = col + anchorCol;
+      const anchorRowAbs = row + anchorRow;
+      const dCol = pointerCol - anchorColAbs;
+      const dRow = pointerRow - anchorRowAbs;
+      const distanceSq = dCol * dCol + dRow * dRow;
+      const heuristic = Math.abs(dCol) + Math.abs(dRow);
+      const shouldUpdate =
+        distanceSq < bestDistance ||
+        (distanceSq === bestDistance &&
+          (heuristic < bestHeuristic ||
+            (heuristic === bestHeuristic &&
+              (!bestPlacement ||
+                row < bestPlacement.row ||
+                (row === bestPlacement.row && col < bestPlacement.col)))));
+      if (shouldUpdate) {
+        bestPlacement = { row, col };
+        bestDistance = distanceSq;
+        bestHeuristic = heuristic;
+      }
+    }
+  }
+
+  return bestPlacement;
+}
+
+function getDropPositionFromIndicator(payload, ignoreItemId = null) {
+  if (!lastIndicatorPlacement || !payload || !payload.size) {
+    return null;
+  }
+  const { row, col } = lastIndicatorPlacement;
+  const { w, h } = payload.size;
+  if (
+    row < 0 ||
+    col < 0 ||
+    col + w > crateConfig.columns ||
+    row + h > crateConfig.rows
+  ) {
+    return null;
+  }
+  return isAreaFree(row, col, w, h, ignoreItemId) ? { row, col } : null;
+}
+
 function handleDragKeydown(event) {
   if (!isDraggingNow || event.defaultPrevented) {
     return;
@@ -560,7 +596,6 @@ function handleDragKeydown(event) {
   if (event.repeat) {
     return;
   }
-  console.log("Пробел нажат");
   event.preventDefault();
   rotateActiveDragPayload();
 }
